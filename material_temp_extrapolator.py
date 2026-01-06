@@ -1,42 +1,27 @@
 """
-Abaqus Material Interpolation/Extrapolation Utility (FINAL)
------------------------------------------------------------
-Atualizações implementadas (para resolver o "flatline" / cauda constante):
-- Adicionado controle explícito do domínio de eps_p quando curvas *PLASTIC têm comprimentos diferentes:
-    EPS_DOMAIN_MODE:
-      - "intersection": usa domínio comum (interseção) entre as temperaturas usadas no método -> recomendado
-      - "reference": usa o eps da curva de referência (mais próxima de T_TARGET), truncado ao domínio comum
+Abaqus material interpolation/extrapolation helper.
 
-- Adicionado controle de extrapolação em eps_p ao interpolar sigma(eps):
-    EPS_EXTRAP_MODE:
-      - "nan": fora do range vira NaN (e depois é mascarado/truncado) -> recomendado junto com truncagem
-      - "clamp": comportamento antigo (np.interp clamp) -> gera flatline
-      - "linear": extrapola em eps usando a inclinação do primeiro/último trecho
+This script parses an Abaqus *MATERIAL card, interpolates or extrapolates
+elastic and plastic data to a target temperature, and exports updated
+material cards plus optional plots.
 
-- M1 (linear local em T) agora:
-    * calcula apenas com os 2 pontos bracketing de T_TARGET
-    * gera eps_target no domínio comum dessas 2 temperaturas
-    * interpola sigma(eps) em cada temperatura sem clamp
-    * interpola em T para obter sigma_target
+Inputs:
+- Abaqus material card text (MATERIAL_TEXT) containing *ELASTIC and *PLASTIC.
+- Target temperature (T_TARGET) for interpolation/extrapolation.
 
-- M2 (quadrático local em T) agora:
-    * usa 3 temperaturas mais próximas de T_TARGET
-    * gera eps_target no domínio comum dessas 3 temperaturas
-    * interpola sigma(eps) em cada temperatura sem clamp
-    * faz ajuste quadrático em T ponto-a-ponto para obter sigma_target
+Outputs:
+- Plots of E(T) and plastic curves (optional).
+- Exported .inp material cards with the target temperature inserted.
 
-- M3 (scale by yield) permanece igual (não gera cauda porque usa eps da curva ref)
+Methods (high level):
+- M1: local linear interpolation in temperature using the two bracketing points.
+- M2: local quadratic interpolation in temperature using the three nearest points.
+- M3: scales a reference plastic curve by the yield-stress ratio.
 
-Observações:
-- As curvas originais são plotadas como estão no input.
-- As curvas geradas (M1/M2/M3) agora não "estouram" o eixo x nem criam platôs artificiais,
-  a menos que você escolha EPS_EXTRAP_MODE="clamp" ou "linear" e/ou use um eps_grid maior.
-
-Requisitos:
-- Python 3.x
-- numpy, matplotlib
+Notes:
+- Intended for sensitivity studies only.
+- Not a substitute for validated material testing data.
 """
-
 from __future__ import annotations
 
 import re
@@ -48,10 +33,10 @@ import matplotlib.pyplot as plt
 
 
 # =============================================================================
-# 0) CONFIGURAÇÕES DO USUÁRIO
+# 0) USER CONFIGURATION
 # =============================================================================
 
-# --- Cole aqui sua carta do Abaqus ---
+# --- Paste your Abaqus material card here ---
 MATERIAL_TEXT = r"""
 *MATERIAL, NAME=TRC103P
 *DENSITY
@@ -102,72 +87,77 @@ MATERIAL_TEXT = r"""
                    19.36,              0.662786491,                     100.
 """
 
-# --- Temperatura alvo (pode ser qualquer valor) ---
+# --- Target temperature (any value) ---
 T_TARGET = -30.0
 
-# --- Exportação / Plot ---
+# --- Export / plot controls ---
 EXPORT_FIGURES = False
 SHOW_FIGURES = True
 EXPORT_CARDS = True
 
-# --- Pasta/Prefixos de saída ---
+# --- Output folder/prefixes ---
 OUTPUT_PREFIX = "OUT_"
 
-# --- Método M3 (shape) ---
-SCALE_REF_T: str | float = "closest"  # ou 23.0, 40.0, etc.
+# --- Method M3 (shape) ---
+SCALE_REF_T: str | float = "closest"  # or 23.0, 40.0, etc.
 
-# --- Tolerâncias ---
+# --- Tolerances ---
 EPS_MATCH_TOL = 1e-9
 
-# --- Controle do domínio de eps_p quando grids têm comprimentos diferentes ---
-# "intersection" -> usar domínio comum das temperaturas usadas no método (mais defensável)
-# "reference"    -> usar eps da curva de referência (closest a T_TARGET) truncado ao domínio comum
+# --- Control eps_p domain when grids have different lengths ---
+# "intersection" -> use the common domain of temps used by the method (safer)
+# "reference"    -> use eps from the reference curve (closest to T_TARGET), trimmed to common domain
 EPS_DOMAIN_MODE = "reference"
 
-# --- Como tratar extrapolação em eps_p no mapeamento sigma(eps) ---
-# "nan"   -> fora do range vira NaN (e é mascarado) [recomendado com truncagem]
-# "clamp" -> platô (comportamento np.interp padrão) [gera flatline]
-# "linear"-> extrapola em eps usando inclinação do primeiro/último trecho
+# --- How to handle eps_p extrapolation when mapping sigma(eps) ---
+# "nan"   -> outside range becomes NaN (then masked) [recommended with truncation]
+# "clamp" -> plateau (np.interp default behavior) [produces flatline]
+# "linear"-> linear extrapolation using first/last segment slope
 EPS_EXTRAP_MODE = "nan"
 
-# --- Quantidade de pontos do eps_grid quando usar "intersection" (grid artificial) ---
+# --- eps_grid size when using "intersection" (artificial grid) ---
 EPS_INTERSECTION_NPTS = 250
 
 
 # =============================================================================
-# 1) ESTRUTURAS / UTILITÁRIOS
+# 1) DATA STRUCTURES / UTILITIES
 # =============================================================================
 
 @dataclass
 class ElasticData:
+    """Parsed elastic data grouped by temperature."""
     temps: np.ndarray
     E: np.ndarray
-    nu: float  # assumido constante
+    nu: float  # assumed constant
 
 
 @dataclass
 class PlasticData:
+    """Parsed plastic data, with original curves and a common grid for utilities."""
     temps: np.ndarray
-    eps_grid: np.ndarray          # grid comum de eps_p (apenas para utilidades gerais)
-    sigma_mat: np.ndarray         # shape (nT, nEps) (apenas para utilidades gerais)
+    eps_grid: np.ndarray          # common eps_p grid (utilities only)
+    sigma_mat: np.ndarray         # shape (nT, nEps) (utilities only)
     original_curves: Dict[float, Tuple[np.ndarray, np.ndarray]]  # {T: (eps, sigma)}
 
 
 def _clean_line(s: str) -> str:
+    """Trim whitespace and a trailing comma from a line."""
     return s.strip().rstrip(",")
 
 
 def _is_keyword(line: str) -> bool:
+    """Return True if a line starts with an Abaqus keyword marker."""
     return line.strip().startswith("*")
 
 
 def _parse_floats_from_csv_line(line: str) -> List[float]:
+    """Parse a comma-separated line into a list of floats."""
     parts = [p.strip() for p in _clean_line(line).split(",") if p.strip()]
     return [float(p) for p in parts]
 
 
 def _enforce_non_decreasing(y: np.ndarray) -> np.ndarray:
-    """Enforce monotonic non-decreasing array."""
+    """Force a monotonic non-decreasing array."""
     out = y.copy()
     for i in range(1, len(out)):
         if out[i] < out[i - 1]:
@@ -176,13 +166,14 @@ def _enforce_non_decreasing(y: np.ndarray) -> np.ndarray:
 
 
 def _safe_positive(y: np.ndarray, floor: float = 1e-12) -> np.ndarray:
+    """Clamp values to a small positive floor."""
     return np.maximum(y, floor)
 
 
 def _find_bracketing_indices(x_sorted: np.ndarray, x0: float) -> Tuple[int, int, str]:
     """
-    Returns (i_low, i_high, region) where region in {"below", "inside", "above"}.
-    Assumes x_sorted strictly increasing.
+    Return (i_low, i_high, region) where region in {"below", "inside", "above"}.
+    Assumes x_sorted is strictly increasing.
     """
     if x0 <= x_sorted[0]:
         return 0, 1 if len(x_sorted) > 1 else 0, "below"
@@ -218,8 +209,8 @@ def piecewise_linear_in_T(T: np.ndarray, y: np.ndarray, T_target: float) -> floa
 
 def local_quadratic_in_T(T: np.ndarray, y: np.ndarray, T_target: float) -> float:
     """
-    Quadrático LOCAL (3 pontos mais próximos de T_target).
-    Se houver <3 pontos: cai para linear local.
+    Local quadratic in temperature (3 nearest points to T_target).
+    If fewer than 3 points exist, fall back to local linear.
     """
     T = np.asarray(T, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -245,17 +236,17 @@ def _choose_ref_temperature(temps: np.ndarray, rule: str | float, T_target: floa
 
 def interp_sigma_vs_eps(eps_new: np.ndarray, eps: np.ndarray, sig: np.ndarray, mode: str) -> np.ndarray:
     """
-    Interpola sigma(eps) e controla o comportamento fora do domínio.
+    Interpolate sigma(eps) and control behavior outside the domain.
     mode:
-      - "nan"   -> NaN fora do range
-      - "clamp" -> platô (extremos)
-      - "linear"-> extrapolação linear usando inclinação do 1º e do último trecho
+      - "nan"   -> NaN outside the range
+      - "clamp" -> plateau (extremes)
+      - "linear"-> linear extrapolation using the first/last segment slope
     """
     eps = np.asarray(eps, float)
     sig = np.asarray(sig, float)
     eps_new = np.asarray(eps_new, float)
 
-    # NaN fora do domínio
+    # Start with NaN outside the domain.
     out = np.interp(eps_new, eps, sig, left=np.nan, right=np.nan)
 
     mode = str(mode).strip().lower()
@@ -270,18 +261,18 @@ def interp_sigma_vs_eps(eps_new: np.ndarray, eps: np.ndarray, sig: np.ndarray, m
 
     if mode == "linear":
         if len(eps) < 2:
-            # sem informação de inclinação -> clamp
+            # No slope information: clamp to the only available value.
             return np.where(np.isnan(out), sig[0], out)
 
         out2 = out.copy()
 
-        # abaixo
+        # Below the minimum.
         denom0 = (eps[1] - eps[0])
         m0 = (sig[1] - sig[0]) / denom0 if denom0 != 0 else 0.0
         mask_lo = np.isnan(out2) & (eps_new < eps[0])
         out2[mask_lo] = sig[0] + m0 * (eps_new[mask_lo] - eps[0])
 
-        # acima
+        # Above the maximum.
         denom1 = (eps[-1] - eps[-2])
         m1 = (sig[-1] - sig[-2]) / denom1 if denom1 != 0 else 0.0
         mask_hi = np.isnan(out2) & (eps_new > eps[-1])
@@ -293,7 +284,7 @@ def interp_sigma_vs_eps(eps_new: np.ndarray, eps: np.ndarray, sig: np.ndarray, m
 
 
 def _domain_common_eps(temps_used: List[float], pl: PlasticData) -> Tuple[float, float]:
-    """Retorna (eps_min, eps_max) do domínio comum entre as temperaturas informadas."""
+    """Return (eps_min, eps_max) for the common domain across the given temperatures."""
     eps_mins = []
     eps_maxs = []
     for T in temps_used:
@@ -305,9 +296,9 @@ def _domain_common_eps(temps_used: List[float], pl: PlasticData) -> Tuple[float,
 
 def _build_eps_target(pl: PlasticData, temps_used: List[float], T_target: float) -> np.ndarray:
     """
-    Constrói o eps_target:
-      - truncado ao domínio comum das temps_used
-      - de acordo com EPS_DOMAIN_MODE
+    Build eps_target:
+      - trimmed to the common domain of temps_used
+      - following EPS_DOMAIN_MODE
     """
     eps_min, eps_max = _domain_common_eps(temps_used, pl)
     if eps_max <= eps_min:
@@ -321,13 +312,13 @@ def _build_eps_target(pl: PlasticData, temps_used: List[float], T_target: float)
         return np.linspace(eps_min, eps_max, int(EPS_INTERSECTION_NPTS), dtype=float)
 
     if mode == "reference":
-        # referência: curva mais próxima de T_target (dentre as disponíveis)
+        # Reference curve: closest to T_target among the available temperatures.
         Tref = float(pl.temps[int(np.argmin(np.abs(pl.temps - T_target)))])
         eps_ref, _ = pl.original_curves[Tref]
         eps_ref = np.asarray(eps_ref, dtype=float)
         eps_ref = eps_ref[(eps_ref >= eps_min) & (eps_ref <= eps_max)]
         if len(eps_ref) < 2:
-            # fallback para intersection
+            # Fallback to intersection if the reference gets too short.
             return np.linspace(eps_min, eps_max, int(EPS_INTERSECTION_NPTS), dtype=float)
         return eps_ref.copy()
 
@@ -335,21 +326,23 @@ def _build_eps_target(pl: PlasticData, temps_used: List[float], T_target: float)
 
 
 # =============================================================================
-# 2) PARSER DA CARTA ABAQUS (preservando textos antes/depois dos blocos)
+# 2) ABAQUS CARD PARSER (preserves text before/after blocks)
 # =============================================================================
 
 @dataclass
 class MaterialSections:
-    header_lines: List[str]        # tudo antes de *ELASTIC
-    elastic_kw_line: str           # linha *ELASTIC...
-    elastic_data_lines: List[str]  # linhas numéricas do elastic
-    middle_lines: List[str]        # tudo entre fim do elastic e começo do plastic
-    plastic_kw_line: str           # linha *PLASTIC...
-    plastic_data_lines: List[str]  # linhas numéricas do plastic
-    footer_lines: List[str]        # tudo depois do plastic
+    """Material card split into header, elastic, plastic, and footer sections."""
+    header_lines: List[str]        # everything before *ELASTIC
+    elastic_kw_line: str           # *ELASTIC keyword line
+    elastic_data_lines: List[str]  # numeric elastic data lines
+    middle_lines: List[str]        # between end of elastic and start of plastic
+    plastic_kw_line: str           # *PLASTIC keyword line
+    plastic_data_lines: List[str]  # numeric plastic data lines
+    footer_lines: List[str]        # everything after plastic
 
 
 def split_material_sections(text: str) -> MaterialSections:
+    """Split a material card into header/elastic/middle/plastic/footer sections."""
     lines = [l.rstrip("\n") for l in text.splitlines() if l.strip()]
 
     elastic_idx = None
@@ -396,6 +389,7 @@ def split_material_sections(text: str) -> MaterialSections:
 
 
 def parse_elastic(elastic_data_lines: List[str]) -> ElasticData:
+    """Parse *ELASTIC data lines into ElasticData."""
     T_list = []
     E_list = []
     nu_list = []
@@ -427,6 +421,7 @@ def parse_elastic(elastic_data_lines: List[str]) -> ElasticData:
 
 
 def parse_plastic(plastic_data_lines: List[str]) -> PlasticData:
+    """Parse *PLASTIC data lines into PlasticData."""
     curves: Dict[float, List[Tuple[float, float]]] = {}
     for l in plastic_data_lines:
         vals = _parse_floats_from_csv_line(l)
@@ -447,7 +442,7 @@ def parse_plastic(plastic_data_lines: List[str]) -> PlasticData:
 
     temps = np.array(sorted(original.keys()), dtype=float)
 
-    # construir eps_grid "global" apenas para utilidades (M3 usa para σy)
+    # Build a "global" eps_grid only for utilities (M3 uses it for sigma_y).
     eps_base = original[float(temps[0])][0]
     same_grid = True
     for T in temps[1:]:
@@ -459,15 +454,15 @@ def parse_plastic(plastic_data_lines: List[str]) -> PlasticData:
     if same_grid:
         eps_grid = eps_base.copy()
     else:
-        # grid global = união de todos os eps, para permitir interpolação estável e σy(T)
+        # Global grid = union of all eps to enable stable interpolation and sigma_y(T).
         eps_all = np.concatenate([original[float(T)][0] for T in temps])
         eps_grid = np.unique(np.sort(eps_all))
 
     sigma_mat = np.zeros((len(temps), len(eps_grid)), dtype=float)
     for i, T in enumerate(temps):
         eps_i, sig_i = original[float(T)]
-        # aqui, por ser "global", vamos usar clamp (np.interp) apenas para preencher sigma_mat.
-        # Esse sigma_mat NÃO será usado para gerar M1/M2 (para evitar flatline).
+        # For the global grid, use clamp (np.interp) only to populate sigma_mat.
+        # This sigma_mat is NOT used to generate M1/M2 (to avoid flatline).
         sigma_mat[i, :] = np.interp(eps_grid, eps_i, sig_i)
 
     for i in range(len(temps)):
@@ -475,13 +470,13 @@ def parse_plastic(plastic_data_lines: List[str]) -> PlasticData:
 
     return PlasticData(temps=temps, eps_grid=eps_grid, sigma_mat=sigma_mat, original_curves=original)
 
-
 # =============================================================================
-# 3) GERAR PROPRIEDADES EM T_TARGET (3 MÉTODOS)
+# 3) COMPUTE PROPERTIES AT T_TARGET (3 METHODS)
 # =============================================================================
 
 @dataclass
 class MethodResult:
+    """Result of a single extrapolation/interpolation method."""
     tag: str
     E_target: float
     nu: float
@@ -491,8 +486,8 @@ class MethodResult:
 
 def compute_target_linear(el: ElasticData, pl: PlasticData, T_target: float) -> MethodResult:
     """
-    M1: Linear local em T usando APENAS as 2 temperaturas bracketing de T_target.
-    eps_target é truncado ao domínio comum dessas 2 curvas -> evita "flatline".
+    M1: local linear in T using ONLY the two temperatures bracketing T_target.
+    eps_target is trimmed to the common domain of those curves to avoid flatline.
     """
     E_t = piecewise_linear_in_T(el.temps, el.E, T_target)
 
@@ -533,13 +528,14 @@ def compute_target_linear(el: ElasticData, pl: PlasticData, T_target: float) -> 
 
 def compute_target_local_quadratic(el: ElasticData, pl: PlasticData, T_target: float) -> MethodResult:
     """
-    M2: Quadrático local em T usando as 3 temperaturas mais próximas de T_target.
-    eps_target é truncado ao domínio comum dessas 3 curvas -> evita "flatline".
+    M2: local quadratic in T using the three nearest temperatures to T_target.
+    eps_target is trimmed to the common domain of those curves to avoid flatline.
     """
     E_t = local_quadratic_in_T(el.temps, el.E, T_target)
 
     if len(pl.temps) < 3:
-        # fallback direto para linear
+        # TODO: MethodResult is a dataclass; _replace likely does not exist here.
+        # Fallback directly to linear.
         return compute_target_linear(el, pl, T_target)._replace(tag="M2_QUADRATIC_LOCAL_FALLBACK")
 
     idx3 = np.argsort(np.abs(pl.temps - T_target))[:3]
@@ -547,7 +543,7 @@ def compute_target_local_quadratic(el: ElasticData, pl: PlasticData, T_target: f
 
     eps_target = _build_eps_target(pl, T_used, T_target)
 
-    # calcular sigma(eps) nas 3 temperaturas e ajustar quadrático em T ponto-a-ponto
+    # Compute sigma(eps) at three temperatures and fit a quadratic in T point-by-point.
     sig_stack = []
     for T in T_used:
         eps_i, sig_i = pl.original_curves[float(T)]
@@ -555,12 +551,12 @@ def compute_target_local_quadratic(el: ElasticData, pl: PlasticData, T_target: f
         sig_stack.append(s_i)
 
     sig_stack = np.vstack(sig_stack)  # (3, nEps)
-    # mascarar pontos onde alguma temperatura deu NaN (não deveria se truncou bem, mas por segurança)
+    # Mask points where any temperature returned NaN (should not happen with truncation).
     mask = np.all(~np.isnan(sig_stack), axis=0)
     eps_target = eps_target[mask]
     sig_stack = sig_stack[:, mask]
 
-    # ajuste quadrático em T para cada coluna
+    # Quadratic fit in T for each column.
     T3 = np.array(T_used, dtype=float)
     sigma_t = np.zeros(sig_stack.shape[1], dtype=float)
     for j in range(sig_stack.shape[1]):
@@ -581,8 +577,8 @@ def compute_target_local_quadratic(el: ElasticData, pl: PlasticData, T_target: f
 
 def compute_target_scaled_by_yield(el: ElasticData, pl: PlasticData, T_target: float, ref_rule: str | float) -> MethodResult:
     """
-    M3: escala a curva de referência pelo ratio de σy(T_target)/σy(T_ref).
-    Não gera "cauda" porque usa eps_ref da curva base.
+    M3: scale a reference curve by the ratio sigma_y(T_target)/sigma_y(T_ref).
+    No tail is created because eps_ref from the base curve is used.
     """
     E_t = piecewise_linear_in_T(el.temps, el.E, T_target)
 
@@ -616,11 +612,18 @@ def compute_target_scaled_by_yield(el: ElasticData, pl: PlasticData, T_target: f
 
 
 # =============================================================================
-# 4) PLOTS (E(T) e curvas plásticas)
+# 4) PLOTS (E(T) AND PLASTIC CURVES)
 # =============================================================================
 
-def plot_elastic(el: ElasticData, T_target: float, results: List[MethodResult],
-                 export: bool, show: bool, filename: str):
+def plot_elastic(
+    el: ElasticData,
+    T_target: float,
+    results: List[MethodResult],
+    export: bool,
+    show: bool,
+    filename: str,
+):
+    """Plot E(T) and highlight the target temperature for each method."""
     plt.figure()
     plt.plot(el.temps, el.E, marker="o", linestyle="-", label="Dados E(T)")
     for res in results:
@@ -639,8 +642,15 @@ def plot_elastic(el: ElasticData, T_target: float, results: List[MethodResult],
     plt.close()
 
 
-def plot_plastic(pl: PlasticData, T_target: float, results: List[MethodResult],
-                 export: bool, show: bool, filename: str):
+def plot_plastic(
+    pl: PlasticData,
+    T_target: float,
+    results: List[MethodResult],
+    export: bool,
+    show: bool,
+    filename: str,
+):
+    """Plot original plastic curves and the extrapolated/interpolated results."""
     plt.figure()
 
     for T in pl.temps:
@@ -666,7 +676,7 @@ def plot_plastic(pl: PlasticData, T_target: float, results: List[MethodResult],
 
 
 # =============================================================================
-# 5) EXPORTAR CARTA COMPLETA ORDENADA POR TEMPERATURA
+# 5) EXPORT FULL MATERIAL CARD ORDERED BY TEMPERATURE
 # =============================================================================
 
 def _format_elastic_line(E: float, nu: float, T: float) -> str:
@@ -677,17 +687,19 @@ def _format_plastic_line(sigma: float, eps_p: float, T: float) -> str:
     return f"{sigma:>20.6f}, {eps_p:>16.9f}, {T:>12.6f}"
 
 
-def export_full_material_inp(sections: MaterialSections,
-                             el: ElasticData,
-                             pl: PlasticData,
-                             T_target: float,
-                             res: MethodResult,
-                             out_path: str):
+def export_full_material_inp(
+    sections: MaterialSections,
+    el: ElasticData,
+    pl: PlasticData,
+    T_target: float,
+    res: MethodResult,
+    out_path: str,
+):
     """
-    Exporta um .inp contendo o MATERIAL completo:
-    - preserva header, middle e footer como no input
-    - reescreve *ELASTIC e *PLASTIC com as temperaturas em ordem crescente,
-      inserindo T_target se não existir, ou substituindo o bloco de T_target se já existir
+    Export a full .inp material card:
+    - preserve header, middle, and footer as in the input
+    - rewrite *ELASTIC and *PLASTIC with temperatures in ascending order,
+      inserting T_target if it does not exist, or replacing its block if it does
     """
     E_map = {float(T): float(E) for T, E in zip(el.temps, el.E)}
     E_map[float(T_target)] = float(res.E_target)
@@ -732,12 +744,12 @@ def export_full_material_inp(sections: MaterialSections,
         for l in sections.footer_lines:
             f.write(l + "\n")
 
-
 # =============================================================================
 # 6) MAIN
 # =============================================================================
 
 def main():
+    """Run the full parse/compute/plot/export pipeline."""
     sections = split_material_sections(MATERIAL_TEXT)
     el = parse_elastic(sections.elastic_data_lines)
     pl = parse_plastic(sections.plastic_data_lines)
