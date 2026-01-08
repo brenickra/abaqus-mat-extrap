@@ -36,6 +36,11 @@ import matplotlib.pyplot as plt
 # 0) USER CONFIGURATION
 # =============================================================================
 
+# --- Method selection ---
+RUN_METHOD_1 = True
+RUN_METHOD_2 = False
+RUN_METHOD_3 = False
+
 # --- Paste your Abaqus material card here ---
 MATERIAL_TEXT = r"""
 *MATERIAL, NAME=TRC103P
@@ -91,9 +96,9 @@ MATERIAL_TEXT = r"""
 T_TARGET = -30.0
 
 # --- Export / plot controls ---
-EXPORT_FIGURES = False
+EXPORT_FIGURES = True
 SHOW_FIGURES = True
-EXPORT_CARDS = True
+EXPORT_CARDS = False
 
 # --- Output folder/prefixes ---
 OUTPUT_PREFIX = "OUT_"
@@ -534,9 +539,15 @@ def compute_target_local_quadratic(el: ElasticData, pl: PlasticData, T_target: f
     E_t = local_quadratic_in_T(el.temps, el.E, T_target)
 
     if len(pl.temps) < 3:
-        # TODO: MethodResult is a dataclass; _replace likely does not exist here.
         # Fallback directly to linear.
-        return compute_target_linear(el, pl, T_target)._replace(tag="M2_QUADRATIC_LOCAL_FALLBACK")
+        fallback = compute_target_linear(el, pl, T_target)
+        return MethodResult(
+            tag="M2_QUADRATIC_LOCAL_FALLBACK",
+            E_target=fallback.E_target,
+            nu=fallback.nu,
+            eps_target=fallback.eps_target,
+            sigma_target=fallback.sigma_target,
+        )
 
     idx3 = np.argsort(np.abs(pl.temps - T_target))[:3]
     T_used = [float(pl.temps[i]) for i in idx3]
@@ -625,11 +636,34 @@ def plot_elastic(
 ):
     """Plot E(T) and highlight the target temperature for each method."""
     plt.figure()
-    plt.plot(el.temps, el.E, marker="o", linestyle="-", label="Dados E(T)")
+    plt.plot(
+        el.temps,
+        el.E,
+        marker="o",
+        linestyle="-",
+        color="0.15",
+        markerfacecolor="0.15",
+        markeredgecolor="0.15",
+        label="Original E(T)",
+    )
     for res in results:
-        plt.scatter([T_target], [res.E_target], marker="x", label=f"{res.tag} @ {T_target:g}°C")
+        if res.tag.startswith("M1"):
+            marker = "x"
+        elif res.tag.startswith("M2"):
+            marker = "+"
+        elif res.tag.startswith("M3"):
+            marker = "^"
+        else:
+            marker = "x"
+        plt.scatter(
+            [T_target],
+            [res.E_target],
+            color="red",
+            marker=marker,
+            label=f"{res.tag} @ {T_target:g} °C",
+        )
     plt.xlabel("Temperatura (°C)")
-    plt.ylabel("E (unidades do input)")
+    plt.ylabel("E (MPa)")
     plt.title("Módulo elástico vs Temperatura")
     plt.grid(True)
     plt.legend()
@@ -653,17 +687,36 @@ def plot_plastic(
     """Plot original plastic curves and the extrapolated/interpolated results."""
     plt.figure()
 
-    for T in pl.temps:
+    if len(pl.temps) > 1:
+        colors = plt.cm.Greys(np.linspace(0.25, 0.75, len(pl.temps)))
+    else:
+        colors = ["0.35"]
+
+    for idx, T in enumerate(pl.temps):
         eps_i, sig_i = pl.original_curves[float(T)]
-        plt.plot(eps_i, sig_i, linestyle="-", label=f"{T:g}°C")
+        plt.plot(eps_i, sig_i, linestyle="-", color=colors[idx], label=f"{T:g} °C")
 
     for res in results:
-        plt.plot(res.eps_target, res.sigma_target, linestyle="--", linewidth=2,
-                 label=f"{res.tag} @ {T_target:g}°C")
+        if res.tag.startswith("M1"):
+            linestyle = "-"
+        elif res.tag.startswith("M2"):
+            linestyle = ":"
+        elif res.tag.startswith("M3"):
+            linestyle = "--"
+        else:
+            linestyle = "-"
+        plt.plot(
+            res.eps_target,
+            res.sigma_target,
+            color="red",
+            linestyle=linestyle,
+            linewidth=2,
+            label=f"{res.tag} @ {T_target:g} °C",
+        )
 
     plt.xlabel("Deformação plástica εp")
-    plt.ylabel("Tensão σ (unidades do input)")
-    plt.title("Curvas *PLASTIC + (interpolação/extrapolação) em T_TARGET")
+    plt.ylabel("Tensão σ (MPa)")
+    plt.title(f"Curvas *PLASTIC + (interpolação/extrapolação) em T_TARGET = {T_target:g} °C")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -754,13 +807,18 @@ def main():
     el = parse_elastic(sections.elastic_data_lines)
     pl = parse_plastic(sections.plastic_data_lines)
 
+    if not (RUN_METHOD_1 or RUN_METHOD_2 or RUN_METHOD_3):
+        raise ValueError(
+            "At least one extrapolation method must be enabled: RUN_METHOD_1 / RUN_METHOD_2 / RUN_METHOD_3."
+        )
+
     results: List[MethodResult] = []
-
-    r1 = compute_target_linear(el, pl, T_TARGET)
-    r2 = compute_target_local_quadratic(el, pl, T_TARGET)
-    r3 = compute_target_scaled_by_yield(el, pl, T_TARGET, SCALE_REF_T)
-
-    results.extend([r1, r2, r3])
+    if RUN_METHOD_1:
+        results.append(compute_target_linear(el, pl, T_TARGET))
+    if RUN_METHOD_2:
+        results.append(compute_target_local_quadratic(el, pl, T_TARGET))
+    if RUN_METHOD_3:
+        results.append(compute_target_scaled_by_yield(el, pl, T_TARGET, SCALE_REF_T))
 
     figE = f"{OUTPUT_PREFIX}Elastic_E_vs_T_T{T_TARGET:g}.png"
     figP = f"{OUTPUT_PREFIX}Plastic_curves_T{T_TARGET:g}.png"
